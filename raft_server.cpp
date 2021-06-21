@@ -57,6 +57,12 @@ uint8_t raft_server<S>::classify_message(zmqpp::message &message) {
   if (message_type == "RequestVoteReply") {
     return RAFT_REPLY_RV;
   }
+  if (message_type == "AppendEntriesReply") {
+    return RAFT_REPLY_AE;
+  }
+  if (message_type == "ClientCommand") {
+    return RAFT_CLIENT_CMD;
+  }
 
   return 0;
 }
@@ -134,13 +140,7 @@ template <int S> void raft_server<S>::handle_timeout_hb() {
   cout << "Handle Timeout HeartBeat" << endl;
 
   raft_message_ae rpc_ae;
-  rpc_ae.term = current_term;
-  rpc_ae.leader_id = peer_address[0];
-  rpc_ae.prev_log_index = last_log_index;
-  rpc_ae.prev_log_term = last_log_term;
-  rpc_ae.nb_entries = 0;
-  rpc_ae.entries.clear();
-  rpc_ae.leader_commit = commit_index;
+  send_rpc_ae_helper(rpc_ae, last_log_index + 1);
 
   for (int i = 0; i < S; i++) {
     send_rpc_ae(peer_address[i], rpc_ae);
@@ -209,11 +209,15 @@ void raft_server<S>::send_reply_rv_reject(raft_message_rv &rpc_rv) {
 }
 
 template <int S> void raft_server<S>::handle_reply_rv(zmqpp::message &message) {
+  cout << "Handle Replay RequestVote ";
+
   uint32_t reply_term;
-  bool voted;
+  bool vote_granted;
 
   message >> reply_term;
-  message >> voted;
+  message >> vote_granted;
+
+  cout << vote_granted << endl;
 
   if (reply_term > current_term) {
     current_term = reply_term;
@@ -223,10 +227,14 @@ template <int S> void raft_server<S>::handle_reply_rv(zmqpp::message &message) {
   }
 
   if (current_state == RAFT_STATE_CANDIDATE && reply_term == current_term &&
-      voted == true) {
+      vote_granted == true) {
     nb_rv_accept += 1;
     if (nb_rv_accept * 2 > S) {
       current_state = RAFT_STATE_LEADER;
+      for (int i = 0; i < S; i++) {
+        next_index[i] = last_log_index + 1;
+        match_index[i] = 0;
+      }
 
       zmqpp::message message;
       message << "TimeoutHeartBeat";
@@ -234,6 +242,28 @@ template <int S> void raft_server<S>::handle_reply_rv(zmqpp::message &message) {
       timeout_ts_hb = current_time_point() + timeout_hb;
     }
   }
+}
+
+template <int S>
+void raft_server<S>::send_rpc_ae_helper(raft_message_ae &rpc_ae,
+                                        uint32_t next_index) {
+  rpc_ae.term = current_term;
+  rpc_ae.leader_id = peer_address[0];
+
+  rpc_ae.prev_log_index = next_index - 1;
+  if (rpc_ae.prev_log_index > 0) {
+    rpc_ae.prev_log_term = log[rpc_ae.prev_log_index - 1].term;
+  } else {
+    rpc_ae.prev_log_term = 0;
+  }
+
+  rpc_ae.nb_entries = last_log_index - next_index + 1;
+  rpc_ae.entries.clear();
+  for (uint32_t i = next_index; i <= last_log_index; i++) {
+    rpc_ae.entries.push_back(log[i - 1]);
+  }
+
+  rpc_ae.leader_commit = commit_index;
 }
 
 template <int S>
@@ -291,6 +321,155 @@ template <int S> void raft_server<S>::handle_rpc_ae(zmqpp::message &message) {
     cout << "Acknowledge Leader: " << voted_for << endl;
     timeout_ts_ae = current_time_point() + timeout_ae();
   }
+
+  if ((rpc_ae.term < current_term) ||
+      (rpc_ae.prev_log_index > last_log_index ||
+       (rpc_ae.prev_log_index > 0 &&
+        rpc_ae.prev_log_term != log[rpc_ae.prev_log_index - 1].term))) {
+    send_reply_ae_reject(rpc_ae);
+  } else {
+    for (uint32_t i = 1; i <= rpc_ae.nb_entries; i++) {
+      uint32_t log_index = rpc_ae.prev_log_index + i;
+
+      if (log_index <= last_log_index &&
+          rpc_ae.entries[i - 1].term != log[log_index - 1].term) {
+        while (log_index <= last_log_index) {
+          log.pop_back();
+          last_log_index -= 1;
+        }
+
+        for (; i < rpc_ae.nb_entries; i++) {
+          log.push_back(rpc_ae.entries[i - 1]);
+          last_log_index += 1;
+        }
+      } else if (log_index == last_log_index + 1) {
+        log.push_back(rpc_ae.entries[i - 1]);
+        last_log_index += 1;
+      }
+    }
+
+    if (rpc_ae.leader_commit > commit_index) {
+      commit_index = min(rpc_ae.leader_commit, last_log_index);
+    }
+    send_reply_ae_accept(rpc_ae);
+  }
+}
+
+template <int S>
+void raft_server<S>::send_reply_ae_accept(raft_message_ae &rpc_ae) {
+  uint32_t match_index = rpc_ae.prev_log_index + rpc_ae.nb_entries;
+  zmqpp::message message;
+  message << "AppendEntriesReply" << current_term << true << peer_address[0]
+          << match_index;
+  send_message(rpc_ae.leader_id, message, "AppendEntriesReply:True");
+}
+
+template <int S>
+void raft_server<S>::send_reply_ae_reject(raft_message_ae &rpc_ae) {
+  zmqpp::message message;
+  message << "AppendEntriesReply" << current_term << false << peer_address[0];
+  send_message(rpc_ae.leader_id, message, "AppendEntriesReply:False");
+}
+
+template <int S> void raft_server<S>::handle_reply_ae(zmqpp::message &message) {
+  cout << "Handle Replay AppendEntries ";
+
+  uint32_t reply_term;
+  bool success;
+
+  uint32_t peer_index;
+  uint32_t peer_log_index;
+
+  message >> reply_term;
+  message >> success;
+
+  cout << success << endl;
+
+  message >> peer_index;
+  peer_index = peer_convert[peer_index];
+
+  if (reply_term > current_term) {
+    current_term = reply_term;
+    current_state = RAFT_STATE_FOLLOWER;
+
+    voted_for = 0;
+  }
+
+  if (current_state == RAFT_STATE_LEADER && reply_term == current_term) {
+    if (success == true) {
+      message >> peer_log_index;
+
+      match_index[peer_index] = peer_log_index;
+      next_index[peer_index] = match_index[peer_index] + 1;
+
+      for (uint32_t log_index = commit_index + 1; log_index <= peer_log_index;
+           log_index++) {
+        int nb_ae_accept = 0;
+        for (int i = 0; i < S; i++) {
+          if (match_index[i] >= log_index) {
+            nb_ae_accept += 1;
+          }
+        }
+        if (nb_ae_accept * 2 > S && log[log_index - 1].term == current_term) {
+          commit_index = log_index;
+        }
+      }
+    } else {
+      next_index[peer_index] = max(1u, next_index[peer_index] - 1);
+
+      raft_message_ae rpc_ae;
+      send_rpc_ae_helper(rpc_ae, next_index[peer_index]);
+
+      send_rpc_ae(peer_address[peer_index], rpc_ae);
+    }
+  }
+}
+
+template <int S>
+void raft_server<S>::handle_client_cmd(zmqpp::message &message) {
+  cout << "Handle Client Command" << endl;
+
+  string command;
+  message >> command;
+
+  if (current_state == RAFT_STATE_FOLLOWER && voted_for != 0) {
+    zmqpp::message redirect_message;
+    redirect_message << "ClientCommand" << command;
+    send_message(voted_for, redirect_message, "Rediect Client Command");
+  }
+  if (current_state == RAFT_STATE_LEADER) {
+    raft_log entry;
+    entry.term = current_term;
+    entry.command = command;
+
+    log.push_back(entry);
+    last_log_term = current_term;
+    last_log_index += 1;
+    for (int i = 0; i < S; i++) {
+      raft_message_ae rpc_ae;
+      send_rpc_ae_helper(rpc_ae, next_index[i]);
+      send_rpc_ae(peer_address[i], rpc_ae);
+    }
+  }
+}
+
+template <int S> void raft_server<S>::handle_commit() {
+  while (commit_index > last_applied) {
+    last_applied += 1;
+    cout << "Apply Log: " << last_applied << " " << log[last_applied - 1].term
+         << " " << log[last_applied - 1].command << endl;
+    state_machine.push_back(log[last_applied - 1]);
+  }
+
+  cout << "Last Applied: " << last_applied << endl;
+  cout << "Last Log Index: " << last_log_index << endl;
+
+  for (uint32_t i = 1; i <= last_applied; i++) {
+    cout << "committed: " << log[i - 1].command << endl;
+  }
+  for (uint32_t i = last_applied + 1; i <= last_log_index; i++) {
+    cout << "uncommitted: " << log[i - 1].command << endl;
+  }
 }
 
 template <int S> void raft_server<S>::main_loop() {
@@ -308,8 +487,10 @@ template <int S> void raft_server<S>::main_loop() {
 
   while (true) {
     cout << "Main Loop" << endl;
-    zmqpp::message message;
 
+    handle_commit();
+
+    zmqpp::message message;
     recv_socket.receive(message);
 
     uint8_t message_type = classify_message(message);
@@ -330,6 +511,12 @@ template <int S> void raft_server<S>::main_loop() {
     }
     if (message_type == RAFT_REPLY_RV) {
       handle_reply_rv(message);
+    }
+    if (message_type == RAFT_REPLY_AE) {
+      handle_reply_ae(message);
+    }
+    if (message_type == RAFT_CLIENT_CMD) {
+      handle_client_cmd(message);
     }
   }
 
